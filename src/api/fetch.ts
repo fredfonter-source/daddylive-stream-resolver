@@ -1,24 +1,16 @@
-import { fetchHtml, htmlHeaders } from "../http.js";
-import { extractBloggerZdecUrl, isBloggerPlayerPage } from "../resolver/extractors/blogger-player.js";
+import {
+  extractBloggerZdecUrl,
+  isBloggerPlayerPage,
+} from "../decrypt/extractors/blogger-player.js";
 import {
   buildWikiPhpUrl,
   extractWikiSportLiveId,
   isWikiSportPage,
-} from "../resolver/extractors/wikisport.js";
+} from "../decrypt/extractors/wikisport.js";
+import { extractInnerFrameUrl } from "../decrypt/index.js";
+import { fetchHtml, htmlHeaders } from "../http.js";
 
-function resolveIframeSrc(src: string, base: string): string | null {
-  const trimmed = src.trim();
-  if (!trimmed || /\+|'|window\.|javascript:|about:|data:/i.test(trimmed)) return null;
-  try {
-    const url = new URL(trimmed, base);
-    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
-    return url.href;
-  } catch {
-    return null;
-  }
-}
-
-export async function resolveRedirectUrl(url: string, referer: string): Promise<string> {
+async function resolveRedirectUrl(url: string, referer: string): Promise<string> {
   const res = await fetch(url, { headers: htmlHeaders(referer), redirect: "manual" });
   const location = res.headers.get("location");
   if (res.status >= 300 && res.status < 400 && location) {
@@ -27,7 +19,7 @@ export async function resolveRedirectUrl(url: string, referer: string): Promise<
   return url;
 }
 
-async function resolveScriptedNextUrl(
+async function nextScriptedUrl(
   html: string,
   pageUrl: string,
   referer: string,
@@ -52,16 +44,13 @@ export async function fetchEmbedHtmlChain(
   let referer = embedUrl;
   for (let depth = 0; depth < 6; depth++) {
     if (await hasPlayable(current)) return { html: current, referer };
-    const inner = current.match(/<iframe[^>]+src="([^"]+)"/i)?.[1];
-    if (inner) {
-      const nextUrl = resolveIframeSrc(inner, referer);
-      if (nextUrl) {
-        current = await fetchHtml(nextUrl, referer);
-        referer = nextUrl;
-        continue;
-      }
+    const frame = extractInnerFrameUrl(current, referer);
+    if (frame) {
+      current = await fetchHtml(frame, referer);
+      referer = frame;
+      continue;
     }
-    const scripted = await resolveScriptedNextUrl(current, referer, referer);
+    const scripted = await nextScriptedUrl(current, referer, referer);
     if (!scripted || scripted === referer) break;
     current = await fetchHtml(scripted, referer);
     referer = scripted;

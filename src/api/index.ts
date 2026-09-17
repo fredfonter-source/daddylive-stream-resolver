@@ -1,12 +1,12 @@
 import { createServer, type ServerResponse } from "node:http";
-import { readFileSync, existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { PLAYER_IDS, type ServerKind } from "../servers/kinds.js";
 import { proxyStream } from "../proxy/stream.js";
 import { renderPage } from "../web/page.js";
-import { handleChannelList } from "./channels.js";
-import { handleResolveLive } from "./resolve.js";
+import { handleLivePlaylist, handleResolveOne } from "./resolve.js";
 
 const PORT = Number(process.env.PORT ?? "3000");
 
@@ -44,17 +44,42 @@ createServer(async (req, res) => {
       send(res, result.status, result.body, result.type, result.headers);
       return;
     }
-    if (url.pathname === "/api/channels") {
-      await handleChannelList(res);
-      return;
-    }
-    if (url.pathname === "/api/resolve/live") {
+    if (url.pathname === "/api/live") {
       const channelId = Number(url.searchParams.get("channel"));
+      const serverParam = url.searchParams.get("server");
       if (!Number.isFinite(channelId) || channelId < 1) {
         send(res, 400, "channel required", "text/plain");
         return;
       }
-      await handleResolveLive(res, channelId, url.origin);
+      if (!serverParam || !PLAYER_IDS.includes(serverParam as ServerKind)) {
+        send(res, 400, "server required", "text/plain");
+        return;
+      }
+      const variantRaw = url.searchParams.get("v");
+      const variant =
+        variantRaw != null && variantRaw !== "" ? Number(variantRaw) : null;
+      await handleLivePlaylist(
+        res,
+        channelId,
+        serverParam as ServerKind,
+        url.origin,
+        url.searchParams.get("u"),
+        Number.isFinite(variant as number) ? (variant as number) : null,
+      );
+      return;
+    }
+    if (url.pathname === "/api/resolve") {
+      const channelId = Number(url.searchParams.get("channel"));
+      const serverParam = url.searchParams.get("server");
+      if (!Number.isFinite(channelId) || channelId < 1) {
+        send(res, 400, "channel required", "text/plain");
+        return;
+      }
+      if (!serverParam || !PLAYER_IDS.includes(serverParam as ServerKind)) {
+        send(res, 400, "server required", "text/plain");
+        return;
+      }
+      await handleResolveOne(res, channelId, serverParam as ServerKind, url.origin);
       return;
     }
     const asset = staticFiles[url.pathname];
