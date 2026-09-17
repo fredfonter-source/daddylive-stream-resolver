@@ -1,58 +1,61 @@
-type Channel = { id: number; name: string };
-
-type ServerKind =
-  | "stream"
-  | "cast"
-  | "watch"
-  | "plus"
-  | "casting"
-  | "player"
-  | "hub";
+type ServerKind = "stream" | "cast" | "watch" | "plus" | "casting" | "player";
 
 type ServerExport = {
   server: ServerKind;
   label: string;
   title: string;
   direct: string;
-  proxied: string;
+  live?: string;
   vlc: string;
   mpv: string;
   isHls: boolean;
-  ms: number;
-  duplicateOf?: ServerKind;
-  duplicateLabel?: string;
+  resolveMs: number;
+  playbackMs?: number;
+  expiresAt?: string;
 };
 
 type ServerFail = {
   server: ServerKind;
   label: string;
   error: string;
-  ms: number;
+  resolveMs: number;
 };
 
-type ServerPending = {
+type ServerIdle = {
   server: ServerKind;
   label: string;
-  ok: false;
-  pending: true;
-  running: boolean;
+  idle: true;
 };
 
-type ServerEntry = (ServerExport & { ok: true }) | (ServerFail & { ok: false }) | ServerPending;
+type ServerRunning = {
+  server: ServerKind;
+  label: string;
+  running: true;
+};
 
-const isPending = (entry: ServerEntry): entry is ServerPending => "pending" in entry && entry.pending;
+type ServerEntry =
+  | (ServerExport & { ok: true })
+  | (ServerFail & { ok: false })
+  | ServerIdle
+  | ServerRunning;
+
+const isIdle = (entry: ServerEntry): entry is ServerIdle => "idle" in entry;
+const isRunning = (entry: ServerEntry): entry is ServerRunning => "running" in entry;
 
 type HlsPlayer = {
   loadSource(url: string): void;
   attachMedia(el: HTMLMediaElement): void;
   on(event: string, cb: (...args: unknown[]) => void): void;
+  startLoad(startPosition?: number): void;
+  recoverMediaError(): void;
   destroy(): void;
 };
 
 type HlsGlobal = {
   isSupported(): boolean;
   Events: { MANIFEST_PARSED: string; ERROR: string };
-  new (): HlsPlayer;
+  ErrorTypes: { NETWORK_ERROR: string; MEDIA_ERROR: string };
+  new (config?: Record<string, unknown>): HlsPlayer;
 };
 
 declare global {
@@ -61,19 +64,40 @@ declare global {
   }
 }
 
+const HLS_LIVE = {
+  enableWorker: true,
+  lowLatencyMode: true,
+  backBufferLength: 90,
+  maxBufferLength: 30,
+  maxMaxBufferLength: 60,
+  maxBufferSize: 60 * 1000 * 1000,
+  maxBufferHole: 0.5,
+  highBufferWatchdogPeriod: 2,
+  nudgeOffset: 0.1,
+  nudgeMaxRetry: 5,
+  maxFragLookUpTolerance: 0.25,
+  liveSyncDurationCount: 3,
+  liveMaxLatencyDurationCount: 10,
+  liveDurationInfinity: true,
+};
+
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T | null;
 
 const ui = {
   form: $<HTMLFormElement>("watch-form"),
   channel: $<HTMLInputElement>("channel"),
-  btn: $<HTMLButtonElement>("resolve-btn"),
-  result: $("result"),
   title: $("stream-title"),
   video: $<HTMLVideoElement>("video"),
   error: $("error"),
-  serversCard: $("servers-card"),
   servers: $("servers"),
+  playerCard: $("player-card"),
+  exportCard: $("export-card"),
+  timing: $("timing"),
+  timingResolve: $("timing-resolve"),
+  timingPlayback: $("timing-playback"),
+  streamNotes: $("stream-notes"),
+  noteDirect: $("note-direct"),
   exports: {
     direct: $<HTMLInputElement>("direct"),
     proxy: $<HTMLInputElement>("proxy"),
@@ -93,39 +117,130 @@ const playerLabel = (server: ServerKind) =>
 const state = {
   hls: null as HlsPlayer | null,
   gen: 0,
-  live: null as EventSource | null,
+  resolveGen: 0,
   label: "",
-  channels: [] as Channel[],
+  channelId: 0,
   servers: [] as ServerEntry[],
   active: "" as ServerKind | "",
+  clocks: {
+    resolve: 0 as number,
+    playback: 0 as number,
+    resolveStart: 0,
+    playbackStart: 0,
+    expiry: 0 as number,
+  },
+  expiresAt: 0,
+};
+
+const fmtRemain = (sec: number) => {
+  if (sec <= 0) return "expired";
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m >= 60) {
+    const h = Math.floor(m / 60);
+    const mm = m % 60;
+    return `${h}h ${mm}m`;
+  }
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+};
+
+const stopExpiryClock = () => {
+  if (state.clocks.expiry) {
+    window.clearInterval(state.clocks.expiry);
+    state.clocks.expiry = 0;
+  }
+  state.expiresAt = 0;
+};
+
+const paintDirectExpiry = () => {
+  if (!ui.noteDirect) return;
+  if (!state.expiresAt) {
+    ui.noteDirect.textContent = "No expiry time found for this link";
+    ui.noteDirect.classList.remove("stream-notes__text--warn");
+    return;
+  }
+  const left = state.expiresAt - Math.floor(Date.now() / 1000);
+  if (left <= 0) {
+    ui.noteDirect.textContent = "Expired — use Our Live URL instead";
+    ui.noteDirect.classList.add("stream-notes__text--warn");
+    return;
+  }
+  ui.noteDirect.textContent = `Expires in ${fmtRemain(left)}`;
+  ui.noteDirect.classList.toggle("stream-notes__text--warn", left <= 60);
+};
+
+const bindStreamNotes = (expiresAt?: string) => {
+  stopExpiryClock();
+  if (ui.streamNotes) ui.streamNotes.hidden = false;
+  const unix = Number(expiresAt);
+  if (Number.isFinite(unix) && unix > 0) {
+    state.expiresAt = unix;
+    paintDirectExpiry();
+    state.clocks.expiry = window.setInterval(paintDirectExpiry, 1000);
+    return;
+  }
+  paintDirectExpiry();
+};
+
+const clearStreamNotes = () => {
+  stopExpiryClock();
+  if (ui.noteDirect) {
+    ui.noteDirect.textContent = "—";
+    ui.noteDirect.classList.remove("stream-notes__text--warn");
+  }
+  if (ui.streamNotes) ui.streamNotes.hidden = true;
+};
+
+const showTiming = () => {
+  if (ui.timing) ui.timing.hidden = false;
+};
+
+const setTimingValue = (kind: "resolve" | "playback", text: string) => {
+  const el = kind === "resolve" ? ui.timingResolve : ui.timingPlayback;
+  if (el) el.textContent = text;
+};
+
+const stopClock = (kind: "resolve" | "playback", finalMs?: number) => {
+  const id = state.clocks[kind];
+  if (id) {
+    window.clearInterval(id);
+    state.clocks[kind] = 0;
+  }
+  const start = kind === "resolve" ? state.clocks.resolveStart : state.clocks.playbackStart;
+  const ms = finalMs ?? (start ? performance.now() - start : 0);
+  setTimingValue(kind, fmtMs(ms));
+  return ms;
+};
+
+const startClock = (kind: "resolve" | "playback") => {
+  stopClock(kind, 0);
+  const started = performance.now();
+  if (kind === "resolve") state.clocks.resolveStart = started;
+  else state.clocks.playbackStart = started;
+  setTimingValue(kind, fmtMs(0));
+  showTiming();
+  state.clocks[kind] = window.setInterval(() => {
+    setTimingValue(kind, fmtMs(performance.now() - started));
+  }, 50);
+};
+
+const clearTiming = () => {
+  stopClock("resolve", 0);
+  stopClock("playback", 0);
+  setTimingValue("resolve", "—");
+  setTimingValue("playback", "—");
+  if (ui.timing) ui.timing.hidden = true;
+  state.clocks.resolveStart = 0;
+  state.clocks.playbackStart = 0;
 };
 
 const fmtMs = (ms: number) => (ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(2)}s`);
 
-const escAttr = (value: string) =>
-  value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
-
 const parseChannelInput = (raw: string): number | null => {
-  const trimmed = raw.trim();
-  const direct = Number(trimmed);
-  if (Number.isFinite(direct) && direct >= 1) return direct;
-  const match = state.channels.find((channel) => channel.name.toLowerCase() === trimmed.toLowerCase());
-  return match?.id ?? null;
+  const id = Number(raw.trim());
+  return Number.isFinite(id) && id >= 1 ? id : null;
 };
-
-const loadChannels = async () => {
-  const res = await fetch("/api/channels");
-  if (!res.ok) return;
-  const channels = (await res.json()) as Channel[];
-  state.channels = channels;
-  const list = document.getElementById("channel-list");
-  if (!list) return;
-  list.innerHTML = channels
-    .map((channel) => `<option value="${channel.id}" label="${escAttr(channel.name)}"></option>`)
-    .join("");
-};
-
-void loadChannels();
 
 const shortError = (message: string) => (message.length <= 40 ? message : `${message.slice(0, 37)}…`);
 
@@ -141,6 +256,7 @@ const hideError = () => {
 
 const stopPlayback = () => {
   state.gen += 1;
+  if (state.clocks.playback) stopClock("playback");
   state.hls?.destroy();
   state.hls = null;
   if (!ui.video) return;
@@ -149,122 +265,119 @@ const stopPlayback = () => {
   ui.video.load();
 };
 
-const stopLive = () => {
-  state.live?.close();
-  state.live = null;
-};
+const playUrl = (entry: ServerExport) =>
+  entry.isHls ? entry.live || entry.direct : entry.direct;
 
-const playStream = async (src: string, isHls: boolean) => {
+const playStream = async (src: string, isHls: boolean): Promise<number> => {
   if (!ui.video) throw new Error("video missing");
-  stopPlayback();
-  const id = state.gen;
+  const id = ++state.gen;
+  startClock("playback");
+  state.hls?.destroy();
+  state.hls = null;
+  ui.video.pause();
+  ui.video.removeAttribute("src");
+  ui.video.load();
   const live = () => id === state.gen;
   const Hls = window.Hls;
-  if (isHls && Hls?.isSupported()) {
-    state.hls = new Hls();
-    state.hls.loadSource(src);
-    state.hls.attachMedia(ui.video);
-    await new Promise<void>((resolve, reject) => {
-      state.hls!.on(Hls.Events.MANIFEST_PARSED, () => resolve());
-      state.hls!.on(Hls.Events.ERROR, (_, detail) => {
-        const err = detail as { fatal?: boolean };
-        if (err.fatal) reject(new Error("playback failed"));
+  try {
+    if (isHls && Hls?.isSupported()) {
+      state.hls = new Hls(HLS_LIVE);
+      state.hls.loadSource(src);
+      state.hls.attachMedia(ui.video);
+      await new Promise<void>((resolve, reject) => {
+        state.hls!.on(Hls.Events.MANIFEST_PARSED, () => resolve());
+        state.hls!.on(Hls.Events.ERROR, (_, detail) => {
+          const err = detail as { fatal?: boolean; type?: string };
+          if (!err.fatal || !state.hls || !Hls) return;
+          if (err.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            state.hls.startLoad();
+            return;
+          }
+          if (err.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            state.hls.recoverMediaError();
+            return;
+          }
+          reject(new Error("playback failed"));
+        });
       });
-    });
-    if (!live()) return;
-    await ui.video.play();
-    return;
-  }
-  if (isHls && ui.video.canPlayType("application/vnd.apple.mpegurl")) {
+      if (!live()) return stopClock("playback");
+      await ui.video.play();
+      return stopClock("playback");
+    }
+    if (isHls && ui.video.canPlayType("application/vnd.apple.mpegurl")) {
+      ui.video.src = src;
+      if (!live()) return stopClock("playback");
+      await ui.video.play();
+      return stopClock("playback");
+    }
     ui.video.src = src;
-    if (!live()) return;
+    await new Promise<void>((resolve, reject) => {
+      const video = ui.video!;
+      const done = () => {
+        video.removeEventListener("loadedmetadata", onReady);
+        video.removeEventListener("error", onErr);
+      };
+      const onReady = () => {
+        done();
+        resolve();
+      };
+      const onErr = () => {
+        done();
+        reject(new Error("playback failed"));
+      };
+      video.addEventListener("loadedmetadata", onReady);
+      video.addEventListener("error", onErr);
+      if (video.readyState >= 1) onReady();
+    });
+    if (!live()) return stopClock("playback");
     await ui.video.play();
-    return;
+    return stopClock("playback");
+  } catch (err) {
+    stopClock("playback");
+    throw err;
   }
-  ui.video.src = src;
-  await new Promise<void>((resolve, reject) => {
-    const video = ui.video!;
-    const done = () => {
-      video.removeEventListener("loadedmetadata", onReady);
-      video.removeEventListener("error", onErr);
-    };
-    const onReady = () => {
-      done();
-      resolve();
-    };
-    const onErr = () => {
-      done();
-      reject(new Error("playback failed"));
-    };
-    video.addEventListener("loadedmetadata", onReady);
-    video.addEventListener("error", onErr);
-    if (video.readyState >= 1) onReady();
-  });
-  if (!live()) return;
-  await ui.video.play();
 };
 
 const bindExports = (entry: ServerExport) => {
   ui.exports.direct!.value = entry.direct;
-  ui.exports.proxy!.value = entry.proxied;
+  ui.exports.proxy!.value = entry.live ?? "";
   ui.exports.vlc!.value = entry.vlc;
   ui.exports.mpv!.value = entry.mpv;
+  if (ui.exportCard) ui.exportCard.hidden = false;
+  bindStreamNotes(entry.expiresAt);
 };
 
 const paintServers = () => {
-  if (!ui.servers || !ui.serversCard) return;
+  if (!ui.servers) return;
   const sorted = [...state.servers].sort(
     (a, b) => PLAYER_IDS.indexOf(a.server) - PLAYER_IDS.indexOf(b.server),
   );
   ui.servers.innerHTML = sorted
     .map((entry) => {
       const name = entry.label;
-      if (isPending(entry)) {
-        const active = entry.running ? " badge--running" : " badge--pending";
-        const ms = entry.running ? "…" : "—";
-        return `<button type="button" class="badge${active}" data-server="${entry.server}" disabled><span class="badge__name">${name}</span><span class="badge__ms">${ms}</span></button>`;
+      if (isIdle(entry)) {
+        return `<button type="button" class="badge" data-server="${entry.server}"><span class="badge__name">${name}</span></button>`;
+      }
+      if (isRunning(entry)) {
+        return `<button type="button" class="badge badge--running" data-server="${entry.server}" disabled><span class="badge__name">${name}</span></button>`;
       }
       const active = entry.server === state.active ? " badge--active" : "";
-      const fail = entry.ok ? "" : " badge--fail";
-      const ms = `<span class="badge__ms">${fmtMs(entry.ms)}</span>`;
-      const dup =
-        entry.ok && entry.duplicateLabel
-          ? `<span class="badge__tag">↔ ${entry.duplicateLabel}</span>`
-          : "";
-      const tag = entry.ok ? dup : `<span class="badge__tag">${shortError(entry.error)}</span>`;
-      const title = entry.ok
-        ? entry.duplicateLabel
-          ? ` title="same stream as ${entry.duplicateLabel}"`
-          : ""
-        : ` title="${entry.error.replace(/"/g, "&quot;")}"`;
-      return `<button type="button" class="badge${active}${fail}" data-server="${entry.server}"${title}><span class="badge__name">${name}</span>${tag}${ms}</button>`;
+      if (!entry.ok) {
+        return `<button type="button" class="badge badge--fail${active}" data-server="${entry.server}" title="${entry.error.replace(/"/g, "&quot;")}"><span class="badge__name">${name}</span><span class="badge__tag">${shortError(entry.error)}</span></button>`;
+      }
+      return `<button type="button" class="badge${active}" data-server="${entry.server}"><span class="badge__name">${name}</span></button>`;
     })
     .join("");
-  ui.serversCard.hidden = state.servers.length === 0;
 };
 
-const setActive = (server: ServerKind) => {
-  state.active = server;
-  if (ui.title) ui.title.textContent = `${state.label} · ${playerLabel(server)}`;
+const resetBadges = () => {
+  state.servers = PLAYER_IDS.map((server) => ({
+    server,
+    label: playerLabel(server),
+    idle: true as const,
+  }));
+  state.active = "";
   paintServers();
-};
-
-const selectServer = async (server: ServerKind) => {
-  const entry = state.servers.find((item) => item.server === server);
-  if (!entry || isPending(entry)) return;
-  if (!entry.ok) {
-    showError(entry.error);
-    setActive(server);
-    return;
-  }
-  hideError();
-  setActive(server);
-  bindExports(entry);
-  try {
-    await playStream(entry.proxied, entry.isHls);
-  } catch {
-    showError("playback failed");
-  }
 };
 
 const upsertServer = (entry: ServerEntry) => {
@@ -273,74 +386,87 @@ const upsertServer = (entry: ServerEntry) => {
   else state.servers.push(entry);
 };
 
-const markRunning = (server: ServerKind) => {
-  state.servers = state.servers.map((entry) =>
-    isPending(entry) ? { ...entry, running: entry.server === server } : entry,
-  );
-};
-
-const onDone = () => {
-  ui.btn!.disabled = false;
-  stopLive();
-  if (state.active) return;
-  const first = state.servers.find((entry) => entry.ok);
-  if (first?.server) void selectServer(first.server);
-  else if (!state.servers.some((entry) => entry.ok)) showError("no players resolved");
-};
-
-const resolveChannel = (channelId: number) => {
-  ui.btn!.disabled = true;
+const selectServer = async (server: ServerKind) => {
+  const channelId = parseChannelInput(ui.channel?.value ?? "");
+  if (!channelId) {
+    showError("enter a valid channel ID");
+    return;
+  }
+  if (ui.channel) ui.channel.value = String(channelId);
+  state.channelId = channelId;
   hideError();
-  stopLive();
   stopPlayback();
-  state.label = "";
-  if (ui.title) ui.title.textContent = "Stream";
-  state.servers = PLAYER_IDS.map((server) => ({
-    server,
-    label: playerLabel(server),
-    ok: false as const,
-    pending: true as const,
-    running: false,
-  }));
-  state.active = "";
-  ui.result!.hidden = false;
-  ui.serversCard!.hidden = false;
-  paintServers();
+  clearTiming();
+  clearStreamNotes();
+  if (ui.playerCard) ui.playerCard.hidden = false;
 
-  let finished = false;
-  state.live = new EventSource(`/api/resolve/live?channel=${channelId}`);
-  state.live.addEventListener("channel", (ev) => {
-    const data = JSON.parse(ev.data) as Channel;
-    state.label = data.name;
-    if (ui.title) {
-      ui.title.textContent = state.active ? `${data.name} · ${playerLabel(state.active)}` : data.name;
+  const reqId = ++state.resolveGen;
+  state.active = server;
+  for (const entry of state.servers) {
+    if (entry.server !== server && isRunning(entry)) {
+      upsertServer({ server: entry.server, label: entry.label, idle: true });
     }
-  });
-  state.live.addEventListener("start", (ev) => {
-    markRunning((JSON.parse(ev.data) as { server: ServerKind }).server);
+  }
+  upsertServer({ server, label: playerLabel(server), running: true });
+  paintServers();
+  if (ui.title) ui.title.textContent = `${state.label || `Channel ${channelId}`} · ${playerLabel(server)}`;
+  startClock("resolve");
+  setTimingValue("playback", "—");
+
+  const live = () => reqId === state.resolveGen;
+
+  try {
+    const res = await fetch(`/api/resolve?channel=${channelId}&server=${server}`);
+    const data = (await res.json()) as ServerExport & { error?: string; resolveMs?: number };
+    if (!live()) return;
+    const resolveMs = stopClock("resolve");
+    if (!res.ok || data.error || !data.direct) {
+      upsertServer({
+        server,
+        label: data.label ?? playerLabel(server),
+        error: data.error ?? "resolve failed",
+        resolveMs: data.resolveMs ?? resolveMs,
+        ok: false,
+      });
+      paintServers();
+      clearStreamNotes();
+      if (ui.exportCard) ui.exportCard.hidden = true;
+      showError(data.error ?? "resolve failed");
+      return;
+    }
+    if (data.title) {
+      const name = data.title.split(" · ")[0];
+      if (name) state.label = name;
+    }
+    bindExports(data);
+    try {
+      const playbackMs = await playStream(playUrl(data), data.isHls);
+      if (!live()) return;
+      upsertServer({ ...data, resolveMs, playbackMs, ok: true });
+      paintServers();
+      hideError();
+    } catch {
+      if (!live()) return;
+      upsertServer({ ...data, resolveMs, ok: true });
+      paintServers();
+      showError("playback failed");
+    }
+  } catch {
+    if (!live()) return;
+    stopClock("resolve");
+    upsertServer({
+      server,
+      label: playerLabel(server),
+      error: "resolve failed",
+      resolveMs: 0,
+      ok: false,
+    });
     paintServers();
-  });
-  state.live.addEventListener("found", (ev) => {
-    const data = JSON.parse(ev.data) as ServerExport;
-    upsertServer({ ...data, ok: true });
-    paintServers();
-    if (!state.active) void selectServer(data.server);
-  });
-  state.live.addEventListener("fail", (ev) => {
-    const data = JSON.parse(ev.data) as ServerFail;
-    upsertServer({ ...data, ok: false });
-    paintServers();
-  });
-  state.live.addEventListener("done", () => {
-    finished = true;
-    onDone();
-  });
-  state.live.onerror = () => {
-    if (finished) return;
-    ui.btn!.disabled = false;
-    stopLive();
-    showError("connection lost");
-  };
+    clearTiming();
+    clearStreamNotes();
+    if (ui.exportCard) ui.exportCard.hidden = true;
+    showError("resolve failed");
+  }
 };
 
 document.querySelectorAll<HTMLButtonElement>("[data-copy]").forEach((btn) => {
@@ -361,25 +487,25 @@ document.querySelectorAll<HTMLButtonElement>("[data-copy]").forEach((btn) => {
 
 ui.servers?.addEventListener("click", (event) => {
   const btn = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-server]");
-  if (!btn?.dataset.server) return;
-  const entry = state.servers.find((item) => item.server === btn.dataset.server);
-  if (!entry || isPending(entry)) return;
-  if (btn.dataset.server === state.active) return;
+  if (!btn?.dataset.server || btn.disabled) return;
   void selectServer(btn.dataset.server as ServerKind);
 });
 
-const runResolve = () => {
-  const channelId = parseChannelInput(ui.channel?.value ?? "");
-  if (!channelId) {
-    showError("enter a valid channel ID or name");
-    return;
-  }
-  if (ui.channel) ui.channel.value = String(channelId);
-  resolveChannel(channelId);
-};
+ui.channel?.addEventListener("change", () => {
+  stopPlayback();
+  state.resolveGen += 1;
+  state.label = "";
+  state.active = "";
+  if (ui.playerCard) ui.playerCard.hidden = true;
+  if (ui.exportCard) ui.exportCard.hidden = true;
+  clearTiming();
+  clearStreamNotes();
+  hideError();
+  resetBadges();
+});
 
-ui.btn?.addEventListener("click", runResolve);
 ui.form?.addEventListener("submit", (event) => {
   event.preventDefault();
-  runResolve();
 });
+
+resetBadges();
