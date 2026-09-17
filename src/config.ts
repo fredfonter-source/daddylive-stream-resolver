@@ -1,1 +1,1 @@
-export const DLHD_BASE = process.env.DLHD_BASE ?? "https://dlhd.st";
+export const DLHD_BASE = process.env.DLHD_BASE ?? "https://dlive.sx";
