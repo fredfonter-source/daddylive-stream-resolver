@@ -1,4 +1,4 @@
-import type { ServerKind } from "../players/types.js";
+import type { ServerKind } from "../servers/kinds.js";
 
 export type { ServerKind };
 
@@ -18,11 +18,4 @@ export type HubConfig = {
   initialToken?: string;
   initialCode?: string;
   initialVideoUrl?: string;
-};
-
-export type AdBlockConfig = {
-  adserverDomain: string;
-  cdnDomain: string;
-  selPath: string;
-  adbVersion: string;
 };
