@@ -48,7 +48,10 @@ createServer(async (req, res) => {
       send(res, result.status, result.body, result.type, result.headers);
       return;
     }
-    if (url.pathname === "/api/live") {
+    if (
+      url.pathname === "/api/live" ||
+      url.pathname === "/api/live.m3u8"
+      ) {
       const channelId = Number(url.searchParams.get("channel"));
       const serverParam = url.searchParams.get("server");
       if (!Number.isFinite(channelId) || channelId < 1) {
