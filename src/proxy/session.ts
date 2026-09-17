@@ -25,8 +25,8 @@ function keyOf(channelId: number, server: ServerKind): string {
 }
 
 export function livePlaylistUrl(channelId: number, server: ServerKind, origin: string): string {
-  return `${origin.replace(/\/$/, "")}/api/live?channel=${channelId}&server=${server}`;
-}
+  return `${origin.replace(/\/$/, "")}/api/live.m3u8?channel=${channelId}&server=${server}`;
+  }
 
 export function streamReferer(resolved: ResolvedStream): string {
   const profile = serverProfile(resolved.server);
