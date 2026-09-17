@@ -38,7 +38,11 @@ createServer(async (req, res) => {
       send(res, 405, "method not allowed", "text/plain");
       return;
     }
-    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+     const publicOrigin =
+       process.env.PUBLIC_ORIGIN ||
+       process.env.RENDER_EXTERNAL_URL ||
+       `http://${req.headers.host ?? "localhost"}`;
+    const url = new URL(req.url ?? "/", publicOrigin);
     if (url.pathname === "/api/proxy") {
       const result = await proxyStream(url.searchParams, url.origin);
       send(res, result.status, result.body, result.type, result.headers);
