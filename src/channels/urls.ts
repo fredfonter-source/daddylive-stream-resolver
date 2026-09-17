@@ -1,5 +1,5 @@
 import { DLHD_BASE } from "../config.js";
-import type { ServerKind } from "../players/types.js";
+import type { ServerKind } from "../servers/kinds.js";
 
 export function watchUrl(channelId: number): string {
   return `${DLHD_BASE}/watch.php?id=${channelId}`;
